@@ -3,8 +3,14 @@ Werk24 Professional Drawing Analysis Service
 High-accuracy 2D technical drawing analysis using Werk24 V2 API
 """
 import asyncio
-from typing import Dict, Any
-from werk24 import Werk24Client, Hook, Ask
+from typing import Dict, Any, List, Optional
+from werk24 import (
+    Werk24Client,
+    Hook,
+    AskMetaData,
+    AskInsights,
+    AskFeatures,
+)
 import logging
 
 from app.models.analysis import (
@@ -68,9 +74,11 @@ class Werk24Analyzer:
         try:
             # Werk24 V2 client
             async with Werk24Client() as client:
-                # V2 API - sadece Ask() kullan
+                # V2 API - spesifik Ask tipleri ile çalış
                 hooks = [
-                    Hook(ask=Ask(), function=self._handle_response),
+                    Hook(ask=AskMetaData(), function=self._handle_response),
+                    Hook(ask=AskFeatures(), function=self._handle_response),
+                    Hook(ask=AskInsights(), function=self._handle_response),
                 ]
                 
                 # BytesIO stream oluştur
@@ -102,14 +110,31 @@ class Werk24Analyzer:
     def _handle_response(self, message):
         """Werk24 V2 API yanıtını işle"""
         try:
+            from werk24.models.v2.responses import (
+                ResponseMetaDataComponentDrawing,
+                ResponseInsightsComponentDrawing,
+                ResponseFeaturesComponentDrawing,
+                ResponseBalloons,
+            )
+            
             if hasattr(message, 'payload_dict'):
                 payload = message.payload_dict
                 logger.info(f"📦 Received: {type(message).__name__}")
                 
                 # Tüm sonuçları results dict'e ekle
                 self.results.update(payload)
-                
-            elif hasattr(message, 'exceptions'):
+            
+            # V2 response tiplerini yakala
+            if isinstance(message, ResponseMetaDataComponentDrawing):
+                self.results["metadata"] = message.model_dump()
+            elif isinstance(message, ResponseInsightsComponentDrawing):
+                self.results["insights"] = message.model_dump()
+            elif isinstance(message, ResponseFeaturesComponentDrawing):
+                self.results["features"] = message.model_dump()
+            elif isinstance(message, ResponseBalloons):
+                self.results["balloons"] = message.model_dump()
+            
+            if hasattr(message, 'exceptions') and message.exceptions:
                 logger.warning(f"⚠️ Error: {message.exceptions}")
                 self.errors.extend(message.exceptions)
         except Exception as e:
@@ -124,16 +149,24 @@ class Werk24Analyzer:
     ) -> DrawingAnalysisResult:
         """Werk24 V2 sonuçlarını DI-2D formatına dönüştür"""
         
-        # Basitleştirilmiş - V2 API tek bir payload döner
-        title = self.results.get('designation', filename)
-        drawing_number = self.results.get('drawing_number', None)
+        metadata = self.results.get("metadata", {})
+        insights = self.results.get("insights", {})
+        features = self.results.get("features", {})
+        
+        title = metadata.get('designation') or filename
+        drawing_number = None
+        revision: Optional[str] = None
+        
+        identifiers: List[Dict[str, Any]] = metadata.get("identifiers", []) or []
+        if identifiers:
+            drawing_number = identifiers[0].get("value")
         
         # Boş yapılar oluştur
         dimensions = {}
         features_list = []
         tolerances = []
         surface_finishes = []
-        material = None
+        material: Optional[MaterialInfo] = None
         
         # Raw results'ı kullan
         raw_results = {
@@ -141,11 +174,114 @@ class Werk24Analyzer:
             'errors': self.errors
         }
         
+        # Malzeme bilgisi
+        material_options: List[Dict[str, Any]] = metadata.get("material_options", []) or []
+        if material_options:
+            material_entry = material_options[0].get("material_combination") or {}
+            material = MaterialInfo(
+                name=str(material_entry) if material_entry else "Unknown",
+                standard=None,
+                density=None,
+                hardness=None,
+            )
+        
+        # Yüzey pürüzlülüğü
+        general_roughness = metadata.get("general_roughness")
+        if general_roughness:
+            surface_finishes.append(
+                SurfaceFinishInfo(
+                    type="roughness",
+                    description="General surface roughness",
+                    roughness=str(general_roughness),
+                )
+            )
+        
+        for rough in features.get("roughnesses", []) or []:
+            surface_finishes.append(
+                SurfaceFinishInfo(
+                    type="roughness",
+                    description=rough.get("label") or "Surface finish",
+                    roughness=str(rough.get("standard") or rough.get("direction_of_lay")),
+                )
+            )
+        
+        # Boyut bilgileri
+        for idx, dim in enumerate(features.get("dimensions", []) or []):
+            size = dim.get("size") or {}
+            confidence = dim.get("confidence") or 0.0
+            if confidence < confidence_threshold:
+                continue
+            
+            label = dim.get("label") or f"dimension_{idx+1}"
+            tolerance_data = size.get("tolerance") or {}
+            tolerance_str = None
+            lower = tolerance_data.get("deviation_lower")
+            upper = tolerance_data.get("deviation_upper")
+            fit = tolerance_data.get("fit")
+            if lower is not None or upper is not None:
+                tolerance_str = f"{lower or 0:+g}/{upper or 0:+g}"
+            elif fit:
+                tolerance_str = f"Fit {fit}"
+            
+            dimensions[label] = DimensionInfo(
+                value=size.get("value", 0.0),
+                unit=size.get("unit", "mm") or "mm",
+                tolerance=tolerance_str,
+                location=dim.get("reference_id")
+            )
+        
+        # Özellikler
+        for bore in features.get("bores", []) or []:
+            if bore.get("confidence", 0) < confidence_threshold:
+                continue
+            
+            feature_dims = {}
+            diameter = (bore.get("diameter") or {}).get("value")
+            if diameter is not None:
+                feature_dims["diameter"] = diameter
+            depth = (bore.get("depth") or {}).get("value")
+            if depth is not None:
+                feature_dims["depth"] = depth
+            
+            features_list.append(
+                FeatureInfo(
+                    type="hole",
+                    quantity=bore.get("quantity", 1) or 1,
+                    dimensions=feature_dims,
+                    position=bore.get("reference_id"),
+                    notes=bore.get("label")
+                )
+            )
+        
+        for chamfer in features.get("chamfers", []) or []:
+            if chamfer.get("confidence", 0) < confidence_threshold:
+                continue
+            features_list.append(
+                FeatureInfo(
+                    type="chamfer",
+                    quantity=chamfer.get("quantity", 1) or 1,
+                    dimensions={"label": chamfer.get("label")},
+                    position=chamfer.get("reference_id"),
+                )
+            )
+        
+        # GD&T toleransları
+        for gdt in features.get("gdnts", []) or []:
+            if gdt.get("confidence", 0) < confidence_threshold:
+                continue
+            tolerances.append(
+                ToleranceInfo(
+                    type="geometric",
+                    value=str(gdt.get("characteristic") or "GD&T"),
+                    reference=gdt.get("reference_id")
+                )
+            )
+        
         # Insights'tan imalat bilgileri (V2 API)
-        insights_data = self.results.get('insights', {})
-        manufacturing_methods = []
-        if insights_data and 'manufacturing_methods' in insights_data:
-            manufacturing_methods = insights_data['manufacturing_methods']
+        primary_process_options = insights.get('primary_process_options', []) or []
+        manufacturing_methods = [
+            option.get("primary_process") for option in primary_process_options if option.get("primary_process")
+        ]
         
         # Geometri analizi
         geometry = GeometryAnalysis(
@@ -201,7 +337,7 @@ class Werk24Analyzer:
             ],
             design_recommendations=[],
             metadata=analysis_metadata,
-            raw_response=self.results if self.results else None
+            raw_response=raw_results if self.results else None
         )
     
     def _build_error_result(
