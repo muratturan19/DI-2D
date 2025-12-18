@@ -1,0 +1,34 @@
+# ===============================================
+# DI-2D Backend Dependencies
+# ===============================================
+# Minimum version requirements - sistemdeki yeni versiyonlar kullanılabilir
+
+# Web Framework
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+python-multipart>=0.0.12
+
+# Data Validation - Compatible versions
+pydantic>=2.12.0
+pydantic-core>=2.41.0
+pydantic-settings>=2.6.0
+
+# AI Models - CRITICAL: OpenAI >= 1.99.0 (GPT-5.2 Responses API için)
+openai>=1.99.0
+anthropic>=0.39.0
+google-generativeai>=0.8.3
+
+# Werk24 Professional API
+werk24>=2.3.0
+
+# Utilities
+python-dotenv>=1.0.1
+aiofiles>=24.1.0
+httpx>=0.27.2
+
+# Image Processing
+Pillow>=10.4.0
+pdf2image>=1.17.0
+opencv-python>=4.10.0.84
+numpy>=2.1.2
+pytesseract>=0.3.13
